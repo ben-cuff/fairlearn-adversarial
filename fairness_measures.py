@@ -171,6 +171,7 @@ class FairnessMetrics:
 
             classifiers = FairnessMetrics(S_train, Y_train, A_train)
             classifiers.train_classifiers(split_data=False)
+
             classifiers.calculate_base_statistics()
 
             independence = classifiers.calculate_independence_metric()
