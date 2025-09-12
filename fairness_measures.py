@@ -8,11 +8,15 @@ class FairnessMetrics:
     def __init__(self, predictions, targets, demographics):
         """
         Initializes the FairnessMetrics class with predictions, targets, and demographics.
-        Standardizes the predictions and targets.
+        Standardizes the predictions and targets, and ensures demographics are binary integers.
         """
-        self.S = (predictions - np.mean(predictions)) / np.std(predictions)
-        self.Y = (targets - np.mean(targets)) / np.std(targets)
-        self.A = demographics
+        self.S = np.array((predictions - np.mean(predictions)) / np.std(predictions))
+        self.Y = np.array((targets - np.mean(targets)) / np.std(targets))
+        self.A = np.array(demographics).astype(int)
+
+        unique_A = np.unique(self.A)
+        if not np.all(np.isin(unique_A, [0, 1])):
+            raise ValueError(f"Demographics A must be binary (0/1). Got values: {unique_A}")
 
     def train_classifiers(self, split_data=True):
         """
@@ -88,22 +92,15 @@ class FairnessMetrics:
         if np.isclose(H_A, 0.0):
             return 0.0
 
-        mutual_information = 0.0
-        n = len(self.S)
+        # Select the predicted probability of the actual group for each sample
+        p_conditional = predicted_probs[np.arange(len(self.A)), self.A]
+        p_marginal = np.where(self.A == 0, p0, p1)
 
-        for i in range(n):
-            actual_group = self.A[i]
-            p_conditional = predicted_probs[i, actual_group]
+        # Compute mutual information in vectorized form
+        valid = (p_conditional > 0) & (p_marginal > 0)
+        mutual_information = np.mean(np.log(p_conditional[valid] / p_marginal[valid]))
 
-            p_marginal = p0 if actual_group == 0 else p1
-
-            if p_conditional > 0 and p_marginal > 0:
-                mutual_information += np.log(p_conditional / p_marginal)
-
-        mutual_information /= n
-
-        normalized_metric = mutual_information / H_A
-        return normalized_metric
+        return mutual_information / H_A
 
     def calculate_separation_metric(self):
         """
@@ -113,27 +110,23 @@ class FairnessMetrics:
         classifier_2 = self.classifiers["separation"][0]
         classifier_3 = self.classifiers["sufficiency"][0]
 
-        n = len(self.S)
-        conditional_entropy = 0.0
-        for i in range(n):
-            p = classifier_2.predict_proba(self.Y[i].reshape(1, -1))[0]
-            conditional_entropy -= np.log(p[self.A[i]])
-        conditional_entropy /= n
+        # Predict all probabilities in batch
+        p_marginal_all = classifier_2.predict_proba(self.Y.reshape(-1, 1))
+        p_joint_all = classifier_3.predict_proba(np.column_stack((self.S, self.Y)))
 
+        p_marginal = p_marginal_all[np.arange(len(self.A)), self.A]
+        p_joint = p_joint_all[np.arange(len(self.A)), self.A]
+
+        # Conditional entropy H(A|Y)
+        conditional_entropy = -np.mean(np.log(p_marginal[p_marginal > 0]))
         if np.isclose(conditional_entropy, 0.0):
             return 0.0
 
-        conditional_mutual_info = 0.0
-        for i in range(n):
-            p_joint = classifier_3.predict_proba(np.array([self.S[i], self.Y[i]]).reshape(1, -1))[
-                0
-            ]
-            p_marginal = classifier_2.predict_proba(self.Y[i].reshape(1, -1))[0]
-            conditional_mutual_info += np.log(p_joint[self.A[i]] / p_marginal[self.A[i]])
-        conditional_mutual_info /= n
+        # Conditional mutual information I(S;A|Y)
+        valid = (p_joint > 0) & (p_marginal > 0)
+        conditional_mutual_info = np.mean(np.log(p_joint[valid] / p_marginal[valid]))
 
-        normalized_metric = conditional_mutual_info / conditional_entropy
-        return normalized_metric
+        return conditional_mutual_info / conditional_entropy
 
     def calculate_sufficiency_metric(self):
         """
@@ -143,44 +136,42 @@ class FairnessMetrics:
         classifier_1 = self.classifiers["independence"][0]
         classifier_3 = self.classifiers["sufficiency"][0]
 
-        n = len(self.S)
-        conditional_entropy = 0.0
-        for i in range(n):
-            p = classifier_1.predict_proba(self.S[i].reshape(1, -1))[0]
-            conditional_entropy -= np.log(p[self.A[i]])
-        conditional_entropy /= n
+        # Predict all probabilities in batch
+        p_marginal_all = classifier_1.predict_proba(self.S.reshape(-1, 1))
+        p_joint_all = classifier_3.predict_proba(np.column_stack((self.S, self.Y)))
 
+        p_marginal = p_marginal_all[np.arange(len(self.A)), self.A]
+        p_joint = p_joint_all[np.arange(len(self.A)), self.A]
+
+        # Conditional entropy H(A|S)
+        conditional_entropy = -np.mean(np.log(p_marginal[p_marginal > 0]))
         if np.isclose(conditional_entropy, 0.0):
             return 0.0
 
-        conditional_mutual_info = 0.0
-        for i in range(n):
-            p_joint = classifier_3.predict_proba(np.array([self.S[i], self.Y[i]]).reshape(1, -1))[
-                0
-            ]
-            p_marginal = classifier_1.predict_proba(self.S[i].reshape(1, -1))[0]
-            conditional_mutual_info += np.log(p_joint[self.A[i]] / p_marginal[self.A[i]])
-        conditional_mutual_info /= n
+        # Conditional mutual information I(Y;A|S)
+        valid = (p_joint > 0) & (p_marginal > 0)
+        conditional_mutual_info = np.mean(np.log(p_joint[valid] / p_marginal[valid]))
 
-        normalized_metric = conditional_mutual_info / conditional_entropy
-        return normalized_metric
+        return conditional_mutual_info / conditional_entropy
 
     def calculate_metrics_with_cross_validation(self, k=10):
         """
         Calculates independence, separation, and sufficiency metrics using k-fold cross-validation.
+        Returns mean and standard deviation for each metric.
         """
         results = []
         kf = KFold(n_splits=k, shuffle=True, random_state=42)
 
         for train_indices, test_indices in kf.split(self.S):
-            S_train, S_test = self.S[train_indices], self.S[test_indices]
-            Y_train, Y_test = self.Y[train_indices], self.Y[test_indices]
-            A_train, A_test = self.A[train_indices], self.A[test_indices]
+            S_train, Y_train, A_train = (
+                self.S[train_indices],
+                self.Y[train_indices],
+                self.A[train_indices],
+            )
 
             classifiers = FairnessMetrics(S_train, Y_train, A_train)
             classifiers.train_classifiers(split_data=False)
-
-            base_stats = classifiers.calculate_base_statistics()
+            classifiers.calculate_base_statistics()
 
             independence = classifiers.calculate_independence_metric()
             separation = classifiers.calculate_separation_metric()
@@ -189,7 +180,9 @@ class FairnessMetrics:
             results.append([independence, separation, sufficiency])
 
         results = np.array(results)
-        mean_metrics = results.mean(axis=0)
-        std_metrics = results.std(axis=0)
+        mean_metrics = dict(
+            zip(["independence", "separation", "sufficiency"], results.mean(axis=0))
+        )
+        std_metrics = dict(zip(["independence", "separation", "sufficiency"], results.std(axis=0)))
 
         return mean_metrics, std_metrics
