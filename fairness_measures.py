@@ -2,6 +2,7 @@ import numpy as np
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import log_loss
 from sklearn.model_selection import train_test_split, KFold
+from sklearn.metrics import roc_curve, auc
 
 
 class FairnessMetrics:
@@ -92,11 +93,9 @@ class FairnessMetrics:
         if np.isclose(H_A, 0.0):
             return 0.0
 
-        # Select the predicted probability of the actual group for each sample
         p_conditional = predicted_probs[np.arange(len(self.A)), self.A]
         p_marginal = np.where(self.A == 0, p0, p1)
 
-        # Compute mutual information in vectorized form
         valid = (p_conditional > 0) & (p_marginal > 0)
         mutual_information = np.mean(np.log(p_conditional[valid] / p_marginal[valid]))
 
@@ -110,19 +109,16 @@ class FairnessMetrics:
         classifier_2 = self.classifiers["separation"][0]
         classifier_3 = self.classifiers["sufficiency"][0]
 
-        # Predict all probabilities in batch
         p_marginal_all = classifier_2.predict_proba(self.Y.reshape(-1, 1))
         p_joint_all = classifier_3.predict_proba(np.column_stack((self.S, self.Y)))
 
         p_marginal = p_marginal_all[np.arange(len(self.A)), self.A]
         p_joint = p_joint_all[np.arange(len(self.A)), self.A]
 
-        # Conditional entropy H(A|Y)
         conditional_entropy = -np.mean(np.log(p_marginal[p_marginal > 0]))
         if np.isclose(conditional_entropy, 0.0):
             return 0.0
 
-        # Conditional mutual information I(S;A|Y)
         valid = (p_joint > 0) & (p_marginal > 0)
         conditional_mutual_info = np.mean(np.log(p_joint[valid] / p_marginal[valid]))
 
@@ -136,19 +132,16 @@ class FairnessMetrics:
         classifier_1 = self.classifiers["independence"][0]
         classifier_3 = self.classifiers["sufficiency"][0]
 
-        # Predict all probabilities in batch
         p_marginal_all = classifier_1.predict_proba(self.S.reshape(-1, 1))
         p_joint_all = classifier_3.predict_proba(np.column_stack((self.S, self.Y)))
 
         p_marginal = p_marginal_all[np.arange(len(self.A)), self.A]
         p_joint = p_joint_all[np.arange(len(self.A)), self.A]
 
-        # Conditional entropy H(A|S)
         conditional_entropy = -np.mean(np.log(p_marginal[p_marginal > 0]))
         if np.isclose(conditional_entropy, 0.0):
             return 0.0
 
-        # Conditional mutual information I(Y;A|S)
         valid = (p_joint > 0) & (p_marginal > 0)
         conditional_mutual_info = np.mean(np.log(p_joint[valid] / p_marginal[valid]))
 
@@ -186,4 +179,36 @@ class FairnessMetrics:
         )
         std_metrics = dict(zip(["independence", "separation", "sufficiency"], results.std(axis=0)))
 
+        self.train_classifiers(split_data=False)
+
         return mean_metrics, std_metrics
+
+    def plot_roc_auc_curve(self, classifier_name):
+        """
+        Plots the ROC AUC curve for the specified classifier.
+        classifier_name: str, one of ["independence", "separation", "sufficiency"]
+        """
+        import matplotlib.pyplot as plt
+
+        if classifier_name not in self.classifiers:
+            raise ValueError(
+                f"Invalid classifier name. Choose from {list(self.classifiers.keys())}."
+            )
+
+        classifier = self.classifiers[classifier_name][0]
+        if classifier_name == "sufficiency":
+            probs = classifier.predict_proba(np.column_stack((self.S, self.Y)))[:, 1]
+        else:
+            probs = classifier.predict_proba(self.S.reshape(-1, 1))[:, 1]
+
+        fpr, tpr, _ = roc_curve(self.A, probs)
+        roc_auc = auc(fpr, tpr)
+
+        plt.figure()
+        plt.plot(fpr, tpr, color="darkorange", lw=2, label=f"ROC curve (area = {roc_auc:.2f})")
+        plt.plot([0, 1], [0, 1], color="navy", lw=2, linestyle="--")
+        plt.xlabel("False Positive Rate")
+        plt.ylabel("True Positive Rate")
+        plt.title(f"ROC Curve for {classifier_name.capitalize()} Classifier")
+        plt.legend(loc="lower right")
+        plt.show()
