@@ -152,11 +152,30 @@ class _AdversarialFairness(BaseEstimator):
     learning_rate : float, default = 0.001
         A small number greater than zero to set as a learning rate.
 
+    learning_rate_decay : float, optional, default = None
+        Optional multiplicative decay factor applied to the learning rate at the end
+        of each epoch. If provided (e.g., :code:`0.95`), the learning rate is multiplied
+        by this factor every epoch. If :code:`None`, no decay is applied.
+
     alpha : float, default = 1.0
         A small number :math:`\alpha` as specified in the paper. It
         is the factor that balances the training towards predicting :code:`y`
         (choose :math:`\alpha` closer to zero) or enforcing fairness constraint
         (choose larger :math:`\alpha`).
+
+    alpha_target : float, optional, default = None
+        Optional upper target for :math:`\alpha`. When provided, :math:`\alpha`
+        is increased after every epoch following a linear schedule so that it
+        reaches :code:`alpha_target` by the last epoch. The ramping step runs
+        after manual :code:`update_alpha` adjustments but before
+        :code:`alpha_decay`, so both mechanisms compose deterministically. The
+        target must be greater than or equal to the starting :code:`alpha`.
+
+    alpha_decay : float, optional, default = None
+        Optional multiplicative decay factor applied to :code:`alpha` at the end
+        of each epoch. If provided (e.g., :code:`0.5`), :code:`alpha` is multiplied
+        by this factor every epoch (decays by 50% each time). If :code:`None`,
+        no decay is applied.
 
     epochs : int, default = 1
         Number of epochs to train for.
@@ -225,8 +244,11 @@ class _AdversarialFairness(BaseEstimator):
         y_transform="auto",
         sf_transform="auto",
         learning_rate=0.001,
+        learning_rate_decay=None,
         alpha=1.0,
+        alpha_target=None,
         epochs=1,
+        alpha_decay=None,
         batch_size=32,
         max_iter=-1,
         shuffle=False,
@@ -251,8 +273,11 @@ class _AdversarialFairness(BaseEstimator):
         self.y_transform = y_transform
         self.sf_transform = sf_transform
         self.learning_rate = learning_rate
+        self.learning_rate_decay = learning_rate_decay
         self.alpha = alpha
+        self.alpha_target = alpha_target
         self.epochs = epochs
+        self.alpha_decay = alpha_decay
         self.batch_size = batch_size
         self.max_iter = max_iter
         self.shuffle = shuffle
@@ -297,7 +322,10 @@ class _AdversarialFairness(BaseEstimator):
         for kw, kwname in (
             (self.learning_rate, "learning_rate"),
             (self.alpha, "alpha"),
+            (self.alpha_target, "alpha_target"),
             (self.progress_updates, "progress_updates"),
+            (self.alpha_decay, "alpha_decay"),
+            (self.learning_rate_decay, "learning_rate_decay"),
         ):
             if kw:
                 check_scalar(
@@ -307,6 +335,23 @@ class _AdversarialFairness(BaseEstimator):
                     min_val=0.0,
                     include_boundaries="left",
                 )
+                if kwname == "alpha_decay" and kw is not None and kw > 1:
+                    warnings.warn(
+                        "alpha_decay > 1 will increase alpha each epoch; typically set it in [0, 1].",
+                        stacklevel=2,
+                    )
+                if kwname == "learning_rate_decay" and kw is not None and kw > 1:
+                    warnings.warn(
+                        "learning_rate_decay > 1 will increase learning rate each epoch; typically set it in [0, 1].",
+                        stacklevel=2,
+                    )
+
+        if self.alpha_target is not None and self.alpha_target < self.alpha:
+            raise ValueError(
+                _KWARG_ERROR_MESSAGE.format(
+                    "alpha_target", "a value greater than or equal to alpha"
+                )
+            )
 
         # Positive or -1 numbers
         for kw, kwname in (
@@ -396,7 +441,18 @@ class _AdversarialFairness(BaseEstimator):
 
         self._is_setup = True
 
-    def fit(self, X, y, *, sensitive_features=None):
+    def fit(
+        self,
+        X,
+        y,
+        *,
+        sensitive_features=None,
+        X_val=None,
+        y_val=None,
+        sensitive_features_val=None,
+        update_epoch=None,
+        update_alpha=None,
+    ):
         """
         Fit the model based on the given training data and sensitive features.
 
@@ -456,10 +512,23 @@ class _AdversarialFairness(BaseEstimator):
         start_time = time()
         last_update_time = start_time
 
-        predictor_losses = [None]
+        predictor_losses = []
         adversary_losses = []
 
+        # Lightweight training history to enable early stopping-style callbacks
+        # Stored on the estimator so external callbacks can inspect.
+        self._history = {
+            "train_predictor_loss": [],
+            "train_adversary_loss": [],
+            "val_predictor_loss": [],
+            "val_adversary_loss": [],
+            "alpha": [],
+            "learning_rate": [],
+        }
+
         self.n_iter_ = 0
+        # Track the initial alpha at the start of training
+        self._alpha_initial_ = self.alpha
         for epoch in range(epochs):
             if self.shuffle:
                 X, y, A = self.backendEngine_.shuffle(X, y, A)
@@ -477,24 +546,33 @@ class _AdversarialFairness(BaseEstimator):
                                 1 - progress
                             )
                             # + 1e-6 for numerical stability
-                            logger.info(
-                                _PROGRESS_UPDATE.format(  # noqa : G001
-                                    "=" * round(20 * progress),
-                                    " " * round(20 * (1 - progress)),  # noqa : G003
-                                    epoch + 1,  # noqa : G003
-                                    epochs,
-                                    " "  # noqa : G003
-                                    * (
-                                        len(str(batch + 1))  # noqa : G003
-                                        - len(str(batches))  # noqa : G003
-                                    ),  # noqa : G003
-                                    batch + 1,  # noqa : G003
-                                    batches,
-                                    ETA,
-                                    predictor_losses[-1],
-                                    adversary_losses[-1],
-                                )
+                            progress_bar = "=" * round(20 * progress) + " " * round(
+                                20 * (1 - progress)
                             )
+                            epoch_info = f"{epoch + 1}/{epochs}"
+                            batch_padding = " " * (len(str(batch + 1)) - len(str(batches)))
+                            batch_info = f"{batch_padding}{batch + 1}/{batches}"
+                            loss_info = f"predictor_loss: {predictor_losses[-1]:.6f}, adversary_loss: {adversary_losses[-1]:.6f}"
+
+                            # print(f"[{progress_bar}] Epoch: {epoch_info}, Batch: {batch_info}, ETA: {ETA:.2f}s, {loss_info}")
+                            # logger.info(
+                            #     _PROGRESS_UPDATE.format(  # noqa : G001
+                            #         "=" * round(20 * progress),
+                            #         " " * round(20 * (1 - progress)),  # noqa : G003
+                            #         epoch + 1,  # noqa : G003
+                            #         epochs,
+                            #         " "  # noqa : G003
+                            #         * (
+                            #             len(str(batch + 1))  # noqa : G003
+                            #             - len(str(batches))  # noqa : G003
+                            #         ),  # noqa : G003
+                            #         batch + 1,  # noqa : G003
+                            #         batches,
+                            #         ETA,
+                            #         predictor_losses[-1],
+                            #         adversary_losses[-1],
+                            #     )
+                            # )
                 batch_slice = slice(
                     batch * batch_size,
                     min((batch + 1) * batch_size, X.shape[0]),
@@ -523,6 +601,89 @@ class _AdversarialFairness(BaseEstimator):
 
                     if stop:
                         return self
+            epoch_adversary_losses = adversary_losses[-batches:]
+            avg_adversary_loss = sum(epoch_adversary_losses) / len(epoch_adversary_losses)
+            epoch_predictor_losses = predictor_losses[-batches:]
+            avg_predictor_loss = sum(epoch_predictor_losses) / len(epoch_predictor_losses)
+            print(
+                f"Epoch {epoch+1}/{epochs}, Average adversary loss: {avg_adversary_loss:.6f}. Average predictor loss: {avg_predictor_loss:.6f}"
+            )
+
+            # Record epoch-level training metrics
+            self._history["train_predictor_loss"].append(avg_predictor_loss)
+            self._history["train_adversary_loss"].append(avg_adversary_loss)
+
+            if update_epoch is not None and epoch + 1 == update_epoch:
+                if update_alpha is not None:
+                    self.alpha = update_alpha
+                    print(f"Alpha updated to {self.alpha} at epoch {epoch + 1}")
+                else:
+                    warnings.warn(
+                        "update_epoch was provided, but update_alpha was not. Alpha not updated."
+                    )
+            # Apply the optional alpha ramp before decays to keep ordering deterministic
+            self._step_alpha_schedule(epoch, epochs)
+            # Apply decays after reporting losses
+            if self.alpha_decay is not None:
+                self.alpha *= self.alpha_decay
+                if self.alpha < 0:
+                    self.alpha = 0.0
+            if self.learning_rate_decay is not None:
+                self.learning_rate *= self.learning_rate_decay
+                setter = getattr(self.backendEngine_, "set_learning_rate", None)
+                if setter:
+                    setter(self.learning_rate)
+            # Optional debug print (can be converted to logger later)
+            print(f"Current alpha {self.alpha}, learning_rate {self.learning_rate}")
+
+            # Track current hyperparameters
+            self._history["alpha"].append(self.alpha)
+            self._history["learning_rate"].append(self.learning_rate)
+
+            if X_val is not None and y_val is not None and sensitive_features_val is not None:
+                X_val_proc, y_val_proc, A_val_proc = self._validate_input(
+                    X_val, y_val, sensitive_features_val
+                )
+
+                val_preds = self.backendEngine_.evaluate(X_val_proc)
+
+                val_pred_loss_tensor = self.backendEngine_.predictor_loss(val_preds, y_val_proc)
+                val_pred_loss = (
+                    val_pred_loss_tensor.item()
+                    if hasattr(val_pred_loss_tensor, "item")
+                    else val_pred_loss_tensor
+                )
+
+                val_adv_preds = self.backendEngine_.adversary_model(val_preds)
+                val_adv_loss_tensor = self.backendEngine_.adversary_loss(val_adv_preds, A_val_proc)
+                val_adv_loss = (
+                    val_adv_loss_tensor.item()
+                    if hasattr(val_adv_loss_tensor, "item")
+                    else val_adv_loss_tensor
+                )
+
+                print(
+                    f"Validation - Epoch {epoch+1}/{epochs}, "
+                    f"Adversary Loss: {val_adv_loss:.6f}, "
+                    f"Predictor Loss: {val_pred_loss:.6f}"
+                )
+
+                # Record validation metrics
+                self._history["val_predictor_loss"].append(val_pred_loss)
+                self._history["val_adversary_loss"].append(val_adv_loss)
+
+            # Give callbacks another chance at the end of the epoch (e.g., early stopping)
+            if self.callbacks_:
+                stop = False
+                for cb in self.callbacks_:
+                    result = cb(
+                        self, step=self.n_iter_, X=X, y=y, z=sensitive_features, pos_label=1
+                    )
+                    if result and not isinstance(result, bool):
+                        raise RuntimeError(_CALLBACK_RETURNS_ERROR)
+                    stop = stop or result
+                if stop:
+                    return self
 
         return self
 
@@ -835,6 +996,24 @@ class _AdversarialFairness(BaseEstimator):
         else:
             raise ValueError(_PREDICTION_FUNCTION_AMBIGUOUS)
 
+    def _step_alpha_schedule(self, epoch_index, total_epochs):
+        """Linearly ramp :code:`alpha` toward :code:`alpha_target`."""
+
+        if self.alpha_target is None or total_epochs <= 0:
+            return
+
+        target = self.alpha_target
+        if self.alpha >= target:
+            return
+
+        remaining_epochs = max(total_epochs - (epoch_index + 1), 0)
+        if remaining_epochs == 0:
+            self.alpha = target
+            return
+
+        increment = (target - self.alpha) / (remaining_epochs + 1)
+        self.alpha += increment
+
     def __sklearn_is_fitted__(self):
         """Speed up check_is_fitted."""
         return hasattr(self, "_is_setup")
@@ -939,6 +1118,18 @@ class AdversarialFairnessClassifier(ClassifierMixin, _AdversarialFairness):
         (choose :math:`\alpha` closer to zero) or enforcing fairness constraint
         (choose larger :math:`\alpha`).
 
+    alpha_target : float, optional, default = None
+        Optional upper target for :math:`\alpha`. When provided, :math:`\alpha`
+        increases after each epoch following a linear schedule so that it
+        reaches :code:`alpha_target` on the final epoch. The schedule runs after
+        manual :code:`update_alpha` hooks but before :code:`alpha_decay`.
+
+    alpha_decay : float, optional, default = None
+        Optional multiplicative decay factor applied to :code:`alpha` at the end
+        of each epoch. If provided (e.g., :code:`0.5`), :code:`alpha` is multiplied
+        by this factor every epoch (decays by 50% each time). If :code:`None`,
+        no decay is applied.
+
     epochs : int, default = 1
         Number of epochs to train for.
 
@@ -1001,8 +1192,11 @@ class AdversarialFairnessClassifier(ClassifierMixin, _AdversarialFairness):
         adversary_optimizer="Adam",
         constraints="demographic_parity",
         learning_rate=0.001,
+        learning_rate_decay=None,
         alpha=1.0,
+        alpha_target=None,
         epochs=1,
+        alpha_decay=None,
         batch_size=32,
         shuffle=False,
         progress_updates=None,
@@ -1025,7 +1219,10 @@ class AdversarialFairnessClassifier(ClassifierMixin, _AdversarialFairness):
             adversary_optimizer=adversary_optimizer,
             constraints=constraints,
             learning_rate=learning_rate,
+            learning_rate_decay=learning_rate_decay,
             alpha=alpha,
+            alpha_target=alpha_target,
+            alpha_decay=alpha_decay,
             epochs=epochs,
             batch_size=batch_size,
             shuffle=shuffle,
@@ -1128,7 +1325,7 @@ class AdversarialFairnessRegressor(RegressorMixin, _AdversarialFairness):
         The fairness constraint. Must be either 'demographic_parity'
         or 'equalized_odds'.
 
-    learning_rate : float, default = 0.001
+        learning_rate : float, default = 0.001
         A small number greater than zero to set as a learning rate.
 
     alpha : float, default = 1.0
@@ -1136,6 +1333,18 @@ class AdversarialFairnessRegressor(RegressorMixin, _AdversarialFairness):
         is the factor that balances the training towards predicting :code:`y`
         (choose :math:`\alpha` closer to zero) or enforcing fairness constraint
         (choose larger :math:`\alpha`).
+
+    alpha_target : float, optional, default = None
+        Optional upper target for :math:`\alpha`. When provided, :math:`\alpha`
+        increases after each epoch following a linear schedule so that it
+        reaches :code:`alpha_target` on the final epoch. The schedule runs after
+        manual :code:`update_alpha` hooks but before :code:`alpha_decay`.
+
+    alpha_decay : float, optional, default = None
+        Optional multiplicative decay factor applied to :code:`alpha` at the end
+        of each epoch. If provided (e.g., :code:`0.5`), :code:`alpha` is multiplied
+        by this factor every epoch (decays by 50% each time). If :code:`None`,
+        no decay is applied.
 
     epochs : int, default = 1
         Number of epochs to train for.
@@ -1193,8 +1402,11 @@ class AdversarialFairnessRegressor(RegressorMixin, _AdversarialFairness):
         adversary_optimizer="Adam",
         constraints="demographic_parity",
         learning_rate=0.001,
+        learning_rate_decay=None,
         alpha=1.0,
+        alpha_target=None,
         epochs=1,
+        alpha_decay=None,
         batch_size=32,
         shuffle=False,
         progress_updates=None,
@@ -1217,7 +1429,10 @@ class AdversarialFairnessRegressor(RegressorMixin, _AdversarialFairness):
             y_transform=None,
             constraints=constraints,
             learning_rate=learning_rate,
+            learning_rate_decay=learning_rate_decay,
             alpha=alpha,
+            alpha_target=alpha_target,
+            alpha_decay=alpha_decay,
             epochs=epochs,
             batch_size=batch_size,
             shuffle=shuffle,

@@ -128,3 +128,12 @@ docs/api_reference/generated/
 
 # Doc build generated files
 *.pkl
+
+# ben-cuff fork changes
+mlar_data
+McDashCore_202403_MasterTables
+mcdash_data
+hmda_data
+gpu_dependencies
+models
+*.csv

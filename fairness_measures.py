@@ -12,8 +12,8 @@ class FairnessMetrics:
         Standardizes the predictions and targets, and ensures demographics are binary integers.
         """
         self.S = np.array((predictions - np.mean(predictions)) / np.std(predictions))
-        self.Y = np.array((targets - np.mean(targets)) / np.std(targets))
-        self.A = np.array(demographics).astype(int)
+        self.Y = np.array((targets - np.mean(targets)) / np.std(targets)).reshape(-1)
+        self.A = np.array(demographics).astype(int).reshape(-1)
 
         unique_A = np.unique(self.A)
         if not np.all(np.isin(unique_A, [0, 1])):
@@ -81,70 +81,83 @@ class FairnessMetrics:
         self.base_stats = {"P(A=0)": p0, "P(A=1)": p1, "H[A]": entropy}
 
     def calculate_independence_metric(self):
-        """
-        Calculates the normalized mutual information between predictions (S)
-        and demographics (A), using the independence classifier.
-        """
         independence = self.classifiers["independence"][0]
-        predicted_probs = independence.predict_proba(self.S.reshape(-1, 1))
-        p0, p1 = self.base_stats["P(A=0)"], self.base_stats["P(A=1)"]
-        H_A = self.base_stats["H[A]"]
+        probs = independence.predict_proba(self.S.reshape(-1, 1))
+        n = len(self.A)
 
-        if np.isclose(H_A, 0.0):
-            return 0.0
+        class_to_idx = {c: i for i, c in enumerate(independence.classes_)}
+        indices = np.array([class_to_idx[int(a)] for a in np.ravel(self.A)])
 
-        p_conditional = predicted_probs[np.arange(len(self.A)), self.A]
-        p_marginal = np.where(self.A == 0, p0, p1)
+        p_conditional = probs[np.arange(n), indices]
+
+        p0 = float(self.base_stats["P(A=0)"])
+        p1 = float(self.base_stats["P(A=1)"])
+        p_marginal = np.where(np.ravel(self.A) == 0, p0, p1)
 
         valid = (p_conditional > 0) & (p_marginal > 0)
-        mutual_information = np.mean(np.log(p_conditional[valid] / p_marginal[valid]))
 
-        return mutual_information / H_A
+        if not np.any(valid):
+            return 0.0
+        mutual_information = np.mean(np.log(p_conditional[valid] / p_marginal[valid]))
+        H_A = self.base_stats["H[A]"]
+        return 0.0 if np.isclose(H_A, 0.0) else mutual_information / H_A
 
     def calculate_separation_metric(self):
-        """
-        Calculates the normalized conditional mutual information between predictions (S)
-        and demographics (A), given targets (Y).
-        """
         classifier_2 = self.classifiers["separation"][0]
         classifier_3 = self.classifiers["sufficiency"][0]
 
-        p_marginal_all = classifier_2.predict_proba(self.Y.reshape(-1, 1))
-        p_joint_all = classifier_3.predict_proba(np.column_stack((self.S, self.Y)))
+        probs_marg = classifier_2.predict_proba(self.Y.reshape(-1, 1))
+        probs_joint = classifier_3.predict_proba(np.column_stack((self.S, self.Y)))
 
-        p_marginal = p_marginal_all[np.arange(len(self.A)), self.A]
-        p_joint = p_joint_all[np.arange(len(self.A)), self.A]
+        n = len(self.A)
 
-        conditional_entropy = -np.mean(np.log(p_marginal[p_marginal > 0]))
-        if np.isclose(conditional_entropy, 0.0):
-            return 0.0
+        map2 = {c: i for i, c in enumerate(classifier_2.classes_)}
+        map3 = {c: i for i, c in enumerate(classifier_3.classes_)}
+
+        idx_m = np.array([map2[int(a)] for a in np.ravel(self.A)])
+        idx_j = np.array([map3[int(a)] for a in np.ravel(self.A)])
+
+        p_marginal = probs_marg[np.arange(n), idx_m]
+        p_joint = probs_joint[np.arange(n), idx_j]
+
+        conditional_entropy = (
+            -np.mean(np.log(p_marginal[p_marginal > 0])) if np.any(p_marginal > 0) else 0.0
+        )
 
         valid = (p_joint > 0) & (p_marginal > 0)
-        conditional_mutual_info = np.mean(np.log(p_joint[valid] / p_marginal[valid]))
+        if not np.any(valid):
+            return 0.0
 
+        conditional_mutual_info = np.mean(np.log(p_joint[valid] / p_marginal[valid]))
         return conditional_mutual_info / conditional_entropy
 
     def calculate_sufficiency_metric(self):
-        """
-        Calculates the normalized conditional mutual information between targets (Y)
-        and demographics (A), given predictions (S).
-        """
         classifier_1 = self.classifiers["independence"][0]
         classifier_3 = self.classifiers["sufficiency"][0]
 
-        p_marginal_all = classifier_1.predict_proba(self.S.reshape(-1, 1))
-        p_joint_all = classifier_3.predict_proba(np.column_stack((self.S, self.Y)))
+        probs_marg = classifier_1.predict_proba(self.S.reshape(-1, 1))
+        probs_joint = classifier_3.predict_proba(np.column_stack((self.S, self.Y)))
 
-        p_marginal = p_marginal_all[np.arange(len(self.A)), self.A]
-        p_joint = p_joint_all[np.arange(len(self.A)), self.A]
+        n = len(self.A)
 
-        conditional_entropy = -np.mean(np.log(p_marginal[p_marginal > 0]))
-        if np.isclose(conditional_entropy, 0.0):
-            return 0.0
+        map1 = {c: i for i, c in enumerate(classifier_1.classes_)}
+        map3 = {c: i for i, c in enumerate(classifier_3.classes_)}
+
+        idx_m = np.array([map1[int(a)] for a in np.ravel(self.A)])
+        idx_j = np.array([map3[int(a)] for a in np.ravel(self.A)])
+
+        p_marginal = probs_marg[np.arange(n), idx_m]
+        p_joint = probs_joint[np.arange(n), idx_j]
+
+        conditional_entropy = (
+            -np.mean(np.log(p_marginal[p_marginal > 0])) if np.any(p_marginal > 0) else 0.0
+        )
 
         valid = (p_joint > 0) & (p_marginal > 0)
-        conditional_mutual_info = np.mean(np.log(p_joint[valid] / p_marginal[valid]))
+        if not np.any(valid):
+            return 0.0
 
+        conditional_mutual_info = np.mean(np.log(p_joint[valid] / p_marginal[valid]))
         return conditional_mutual_info / conditional_entropy
 
     def calculate_metrics_with_cross_validation(self, k=10):
@@ -181,7 +194,7 @@ class FairnessMetrics:
 
         self.train_classifiers(split_data=False)
 
-        return mean_metrics, std_metrics
+        return {"mean_metrics": mean_metrics, "std_metrics": std_metrics}
 
     def plot_roc_auc_curve(self, classifier_name):
         """

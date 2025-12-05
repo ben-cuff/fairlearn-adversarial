@@ -240,3 +240,11 @@ class BackendEngine:
             list of keywords.
         """
         raise NotImplementedError(_NOT_IMPLEMENTED)
+
+    # Optional convenience to update learning rates during training
+    def set_learning_rate(self, lr: float):
+        """Set learning rate for both predictor and adversary optimizers.
+
+        Backends should override this to update their optimizer objects.
+        """
+        raise NotImplementedError(_NOT_IMPLEMENTED)

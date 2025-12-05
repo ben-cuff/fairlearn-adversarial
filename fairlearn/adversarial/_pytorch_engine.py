@@ -97,8 +97,10 @@ class PytorchEngine(BackendEngine):
         # For equalized odds
         if self.base.pass_y_:
             Y_hat = torch.cat((Y_hat, Y), dim=1)
+        print(self.adversary_model)
 
         A_hat = self.adversary_model(Y_hat)
+        print(f"A_hat min: {A_hat.min().item()}, max: {A_hat.max().item()}")
         LA = self.adversary_loss(A_hat, A)
         LA.backward()
 
@@ -127,6 +129,13 @@ class PytorchEngine(BackendEngine):
                 optim = torch.optim.SGD
         if optim is not None:
             return optim(model.parameters(), lr=self.base.learning_rate)
+
+    def set_learning_rate(self, lr: float):
+        """Update learning rate for predictor & adversary optimizers if supported."""
+        for optim in [self.predictor_optimizer, self.adversary_optimizer]:
+            if hasattr(optim, "param_groups"):
+                for group in optim.param_groups:
+                    group["lr"] = lr
 
     def get_loss(self, dist_type):
         """Get loss function corresponding to the keyword."""

@@ -206,6 +206,17 @@ Some pieces of advice regarding training with adversarial fairness:
    as the global step count increases. In particular, use a callback function to perform
    these hyperparameter updates. An example can be seen in the example notebook.
 
+Both :class:`~fairlearn.adversarial.AdversarialFairnessClassifier` and
+:class:`~fairlearn.adversarial.AdversarialFairnessRegressor` also expose an
+:code:`alpha_target` keyword. When set (and greater than or equal to the
+initial :code:`alpha`), the optimizer linearly ramps :code:`alpha` after each
+epoch so that it reaches :code:`alpha_target` on the last epoch. The ramp
+executes after any explicit :code:`update_alpha` adjustment you trigger but
+before :code:`alpha_decay` is applied, which means decay still affects the value
+that gets recorded for the next epoch. If decay or callbacks lower
+:code:`alpha`, the ramp automatically recalculates the remaining increments so
+the final epoch still approaches :code:`alpha_target`.
+
 Refer to the following examples for more details:
 
 - :ref:`sphx_glr_auto_examples_plot_adversarial_basics.py`

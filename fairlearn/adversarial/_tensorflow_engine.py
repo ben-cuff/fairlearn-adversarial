@@ -101,6 +101,19 @@ class TensorflowEngine(BackendEngine):
         if optim is not None:
             return optim(learning_rate=self.base.learning_rate)
 
+    def set_learning_rate(self, lr: float):
+        """Update learning rate for predictor & adversary optimizers if supported."""
+        for optim in [self.predictor_optimizer, self.adversary_optimizer]:
+            try:
+                # If it's a variable or has assign
+                if hasattr(optim.learning_rate, "assign"):
+                    optim.learning_rate.assign(lr)
+                else:
+                    optim.learning_rate = lr
+            except Exception:
+                # Fallback simple assignment
+                optim.learning_rate = lr
+
     def get_loss(self, dist_type):
         """Get loss function corresponding to the keyword."""
         if dist_type == "binary":
