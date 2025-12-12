@@ -162,6 +162,7 @@ def fit_adversarial_regressor(
     y_val=None,
     sensitive_val=None,
     is_regression=True,
+    baseline=None,
     filename=None,
     batch_size=256,
     epochs=50,
@@ -175,6 +176,79 @@ def fit_adversarial_regressor(
     update_alpha=None,
     update_epoch=None,
 ):
+    if baseline == "logit":
+        if is_regression:
+            raise ValueError(
+                "Baseline 'logit' is only valid for classification (set is_regression=False)"
+            )
+
+        class _LogitAdapter:
+            def __init__(self, random_state=42):
+                self.model = LogisticRegression(
+                    random_state=random_state,
+                    solver="liblinear",
+                    max_iter=1000,
+                )
+
+            def fit(self, X, y, **kwargs):
+                self.model.fit(X, np.asarray(y).ravel())
+
+            def _raw_predict(self, X):
+                proba = self.model.predict_proba(X)
+                return proba[:, 1]
+
+            def predict(self, X):
+                return self._raw_predict(X)
+
+        mitigator = _LogitAdapter(random_state=random_state)
+        scaler = StandardScaler()
+        X_train_scaled = scaler.fit_transform(X_train).astype(np.float32)
+        X_val_scaled = scaler.transform(X_val).astype(np.float32) if X_val is not None else None
+        mitigator.fit(X_train_scaled, y_train)
+
+        return mitigator, scaler
+
+    if baseline == "ols":
+        if not is_regression:
+            raise ValueError(
+                "Baseline 'ols' is only valid for regression (set is_regression=True)"
+            )
+
+        class _OLSAdapter:
+            def __init__(self):
+                try:
+                    import statsmodels.api as sm
+
+                    self._lib = "statsmodels"
+                    self.sm = sm
+                    self.model = None
+                except Exception:
+                    from sklearn.linear_model import LinearRegression
+
+                    self._lib = "sklearn"
+                    self.lr = LinearRegression()
+
+            def fit(self, X, y, **kwargs):
+                y = np.asarray(y).ravel()
+                if self._lib == "statsmodels":
+                    Xc = self.sm.add_constant(X, has_constant="add")
+                    self.model = self.sm.OLS(y, Xc).fit()
+                else:
+                    self.lr.fit(X, y)
+
+            def predict(self, X):
+                if self._lib == "statsmodels":
+                    Xc = self.sm.add_constant(X, has_constant="add")
+                    return self.model.predict(Xc)
+                return self.lr.predict(X)
+
+        mitigator = _OLSAdapter()
+        scaler = StandardScaler()
+        X_train_scaled = scaler.fit_transform(X_train).astype(np.float32)
+        mitigator.fit(X_train_scaled, y_train)
+
+        return mitigator, scaler
+
     predictor_model = build_predictor(
         use_skip_connections, input_dim=X_train.shape[1], is_regression=is_regression
     )
