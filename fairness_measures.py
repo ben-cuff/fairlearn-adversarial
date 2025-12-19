@@ -211,6 +211,8 @@ class FairnessMetrics:
         classifier = self.classifiers[classifier_name][0]
         if classifier_name == "sufficiency":
             probs = classifier.predict_proba(np.column_stack((self.S, self.Y)))[:, 1]
+        elif classifier_name == "separation":
+            probs = classifier.predict_proba(self.Y.reshape(-1, 1))[:, 1]
         else:
             probs = classifier.predict_proba(self.S.reshape(-1, 1))[:, 1]
 
@@ -225,3 +227,30 @@ class FairnessMetrics:
         plt.title(f"ROC Curve for {classifier_name.capitalize()} Classifier")
         plt.legend(loc="lower right")
         plt.show()
+
+    def get_roc_curve_data(self, classifier_name):
+        """
+        Returns ROC curve data for the specified classifier without plotting.
+        Output dict contains: fpr, tpr, thresholds, auc.
+        classifier_name: str, one of ["independence", "separation", "sufficiency"]
+        """
+        if classifier_name not in self.classifiers:
+            raise ValueError(
+                f"Invalid classifier name. Choose from {list(self.classifiers.keys())}."
+            )
+
+        classifier = self.classifiers[classifier_name][0]
+        if classifier_name == "sufficiency":
+            probs = classifier.predict_proba(np.column_stack((self.S, self.Y)))[:, 1]
+        elif classifier_name == "separation":
+            probs = classifier.predict_proba(self.Y.reshape(-1, 1))[:, 1]
+        else:
+            probs = classifier.predict_proba(self.S.reshape(-1, 1))[:, 1]
+
+        fpr, tpr, thresholds = roc_curve(self.A, probs)
+        return {
+            "fpr": fpr.tolist(),
+            "tpr": tpr.tolist(),
+            "thresholds": thresholds.tolist(),
+            "auc": float(auc(fpr, tpr)),
+        }

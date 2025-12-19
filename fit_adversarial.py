@@ -34,7 +34,29 @@ from tensorflow import keras
 import matplotlib.pyplot as plt
 
 
-def build_predictor(use_skip_connections=False, input_dim=None, is_regression=True):
+def build_predictor(
+    use_skip_connections=False,
+    input_dim=None,
+    is_regression=True,
+    predictor_mode: str = "mlp",
+):
+    # Special regression predictor: sum of 15 sigmoids
+    if is_regression and predictor_mode == "sigmoid_sum15":
+        inputs = Input(shape=(input_dim,))
+        x = Dense(256, kernel_regularizer=regularizers.l2(1e-4))(inputs)
+        x = BatchNormalization()(x)
+        x = LeakyReLU()(x)
+        x = Dropout(0.3)(x)
+        x = Dense(128)(x)
+        x = LeakyReLU()(x)
+        # Produce 15 sigmoid components
+        comps = Dense(15, activation="sigmoid")(x)
+        # Sum the 15 components to make the prediction
+        from tensorflow.keras.layers import Lambda
+
+        summed = Lambda(lambda t: tf.reduce_sum(t, axis=-1, keepdims=True))(comps)
+        outputs = summed
+        return Model(inputs, outputs)
     if not use_skip_connections and is_regression:
         return Sequential(
             [
@@ -175,6 +197,7 @@ def fit_adversarial_regressor(
     callbacks=None,
     update_alpha=None,
     update_epoch=None,
+    predictor_mode: str = "mlp",
 ):
     if baseline == "logit":
         if is_regression:
@@ -250,7 +273,10 @@ def fit_adversarial_regressor(
         return mitigator, scaler
 
     predictor_model = build_predictor(
-        use_skip_connections, input_dim=X_train.shape[1], is_regression=is_regression
+        use_skip_connections,
+        input_dim=X_train.shape[1],
+        is_regression=is_regression,
+        predictor_mode=predictor_mode,
     )
     adversary_model = build_adversary(use_skip_connections)
 
@@ -398,9 +424,16 @@ def evaluate_fairness(y_pred, target, minority, verbose=False):
     metrics = fairness_metrics.calculate_metrics_with_cross_validation()
     fairness_metrics.train_classifiers(split_data=False)
 
+    roc_curves = {}
+    for criterion in ["independence", "separation", "sufficiency"]:
+        try:
+            roc_curves[criterion] = fairness_metrics.get_roc_curve_data(criterion)
+        except Exception as e:
+            roc_curves[criterion] = {"error": str(e)}
+
     if verbose:
         print(metrics)
         for criterion in ["independence", "separation", "sufficiency"]:
             fairness_metrics.plot_roc_auc_curve(criterion)
 
-    return metrics
+    return {"metrics": metrics, "roc_curves": roc_curves}
